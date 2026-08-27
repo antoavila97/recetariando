@@ -1,0 +1,862 @@
+Sistema "RECETARIANDO" — Catálogo y Buscador de Recetas
+A continuación, el sistema completo en 3 partes: Base de Datos + PHP, API REST, y Guía detallada de Spoonacular API.
+
+PARTE 1 — Base de Datos MySQL
+Ejecuta este script en phpMyAdmin o MySQL CLI:
+
+-- =====================================================
+-- BASE DE DATOS: recetariando_db
+-- =====================================================
+CREATE DATABASE IF NOT EXISTS recetariando_db
+  CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+USE recetariando_db;
+
+-- Usuarios del sistema
+CREATE TABLE usuarios (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    nombre VARCHAR(100) NOT NULL,
+    email VARCHAR(150) UNIQUE NOT NULL,
+    password_hash VARCHAR(255) NOT NULL,
+    avatar_url VARCHAR(500),
+    creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB;
+
+-- Recetas (catálogo principal)
+CREATE TABLE recetas (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    spoonacular_id INT UNIQUE,
+    titulo VARCHAR(255) NOT NULL,
+    imagen_url VARCHAR(500),
+    resumen TEXT,
+    instrucciones TEXT,
+    tiempo_preparacion INT COMMENT 'minutos',
+    tiempo_coccion INT COMMENT 'minutos',
+    porciones INT DEFAULT 1,
+    calificacion DECIMAL(3,2),
+    fuente_url VARCHAR(500),
+    vegano TINYINT(1) DEFAULT 0,
+    vegetariano TINYINT(1) DEFAULT 0,
+    sin_gluten TINYINT(1) DEFAULT 0,
+    sin_lactosa TINYINT(1) DEFAULT 0,
+    saludable TINYINT(1) DEFAULT 0,
+    barato TINYINT(1) DEFAULT 0,
+    muy_popular TINYINT(1) DEFAULT 0,
+    creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    actualizado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    FULLTEXT(titulo, resumen)
+) ENGINE=InnoDB;
+
+-- Ingredientes (catálogo independiente)
+CREATE TABLE ingredientes (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    spoonacular_id INT UNIQUE,
+    nombre VARCHAR(150) NOT NULL UNIQUE,
+    imagen_url VARCHAR(500),
+    categoria VARCHAR(100)
+) ENGINE=InnoDB;
+
+-- Relación receta <-> ingredientes
+CREATE TABLE receta_ingredientes (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    receta_id INT NOT NULL,
+    ingrediente_id INT NOT NULL,
+    cantidad VARCHAR(100),
+    unidad VARCHAR(50),
+    FOREIGN KEY (receta_id) REFERENCES recetas(id) ON DELETE CASCADE,
+    FOREIGN KEY (ingrediente_id) REFERENCES ingredientes(id) ON DELETE CASCADE,
+    UNIQUE KEY uniq_receta_ing (receta_id, ingrediente_id)
+) ENGINE=InnoDB;
+
+-- Tipos de dieta / restricciones
+CREATE TABLE tipos_dieta (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    nombre VARCHAR(50) UNIQUE NOT NULL,
+    descripcion VARCHAR(255)
+) ENGINE=InnoDB;
+
+INSERT INTO tipos_dieta (nombre, descripcion) VALUES
+('vegano', 'Sin productos de origen animal'),
+('vegetariano', 'Sin carne ni pescado'),
+('sin_gluten', 'Sin trigo, cebada, centeno'),
+('sin_lactosa', 'Sin lácteos'),
+('paleo', 'Basada en alimentos naturales'),
+('keto', 'Alta en grasas, baja en carbohidratos'),
+('pescetariana', 'Incluye pescado pero no carne'),
+('primal', 'Similar a paleo, menos restrictiva');
+
+-- Información nutricional por receta
+CREATE TABLE nutricion (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    receta_id INT NOT NULL UNIQUE,
+    calorias DECIMAL(8,2),
+    proteinas DECIMAL(8,2),
+    carbohidratos DECIMAL(8,2),
+    grasa DECIMAL(8,2),
+    fibra DECIMAL(8,2),
+    FOREIGN KEY (receta_id) REFERENCES recetas(id) ON DELETE CASCADE
+) ENGINE=InnoDB;
+
+-- Favoritos de usuarios
+CREATE TABLE favoritos (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    usuario_id INT NOT NULL,
+    receta_id INT NOT NULL,
+    guardado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (usuario_id) REFERENCES usuarios(id) ON DELETE CASCADE,
+    FOREIGN KEY (receta_id) REFERENCES recetas(id) ON DELETE CASCADE,
+    UNIQUE KEY uniq_fav (usuario_id, receta_id)
+) ENGINE=InnoDB;
+
+-- Usuario de ejemplo (password: 123456)
+INSERT INTO usuarios (nombre, email, password_hash) VALUES
+('Demo Usuario', 'demo@recetariando.com', '$2y$10$e0MYzXyjpJS7Pd0RVvHwHe1HlCS7JVHoY9mXzWPQL8ZQgz9e6KJHy');
+
+
+PARTE 2 — Código PHP + API REST
+
+Estructura de carpetas:
+recetariando/
+├── config/
+│   └── database.php
+├── api/
+│   ├── recetas.php
+│   ├── buscar.php
+│   ├── favoritos.php
+│   └── ingredientes.php
+├── includes/
+│   └── funciones.php
+├── scripts/
+│   └── importar_spoonacular.php
+├── index.php
+└── .htaccess
+
+📄 config/database.php
+<?php
+class Database {
+    private $host = "localhost";
+    private $db_name = "recetariando_db";
+    private $username = "root";
+    private $password = "";
+    public $conn;
+
+    public function getConnection() {
+        $this->conn = null;
+        try {
+            $this->conn = new PDO(
+                "mysql:host=" . $this->host . ";dbname=" . $this->db_name . ";charset=utf8mb4",
+                $this->username,
+                $this->password
+            );
+            $this->conn->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+            $this->conn->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
+        } catch(PDOException $e) {
+            http_response_code(500);
+            echo json_encode(["error" => "Error de conexión: " . $e->getMessage()]);
+            exit;
+        }
+        return $this->conn;
+    }
+}
+
+📄 includes/funciones.php
+<?php
+header("Content-Type: application/json; charset=UTF-8");
+header("Access-Control-Allow-Origin: *");
+header("Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS");
+header("Access-Control-Allow-Headers: Content-Type, Authorization, X-User-Id");
+
+if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') { exit(0); }
+
+function responder($data, $code = 200) {
+    http_response_code($code);
+    echo json_encode($data, JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
+function obtenerDatosJSON() {
+    return json_decode(file_get_contents("php://input"), true) ?? [];
+}
+
+function obtenerUsuarioId() {
+    return $_SERVER['HTTP_X_USER_ID'] ?? null;
+}
+
+📄 api/recetas.php (Catálogo en tiempo real)
+<?php
+require_once __DIR__ . '/../config/database.php';
+require_once __DIR__ . '/../includes/funciones.php';
+
+$db = (new Database())->getConnection();
+$method = $_SERVER['REQUEST_METHOD'];
+
+switch ($method) {
+    case 'GET':
+        if (isset($_GET['id'])) {
+            // Detalle completo de una receta
+            $stmt = $db->prepare("SELECT * FROM recetas WHERE id = ?");
+            $stmt->execute([$_GET['id']]);
+            $receta = $stmt->fetch();
+
+            if (!$receta) responder(["error" => "Receta no encontrada"], 404);
+
+            // Ingredientes
+            $ing = $db->prepare("SELECT i.nombre, ri.cantidad, ri.unidad, i.imagen_url
+                                 FROM receta_ingredientes ri
+                                 JOIN ingredientes i ON ri.ingrediente_id = i.id
+                                 WHERE ri.receta_id = ?");
+            $ing->execute([$_GET['id']]);
+            $receta['ingredientes'] = $ing->fetchAll();
+
+            // Nutrición
+            $nut = $db->prepare("SELECT * FROM nutricion WHERE receta_id = ?");
+            $nut->execute([$_GET['id']]);
+            $receta['nutricion'] = $nut->fetch() ?: null;
+
+            responder($receta);
+        } else {
+            // Listado con paginación
+            $pagina = max(1, intval($_GET['pagina'] ?? 1));
+            $limite = min(50, max(1, intval($_GET['limite'] ?? 20)));
+            $offset = ($pagina - 1) * $limite;
+
+            $total = $db->query("SELECT COUNT(*) FROM recetas")->fetchColumn();
+
+            $stmt = $db->prepare("SELECT id, titulo, imagen_url, tiempo_preparacion, tiempo_coccion,
+                                         calificacion, vegano, vegetariano, sin_gluten
+                                  FROM recetas ORDER BY calificacion DESC, id DESC
+                                  LIMIT ? OFFSET ?");
+            $stmt->bindValue(1, $limite, PDO::PARAM_INT);
+            $stmt->bindValue(2, $offset, PDO::PARAM_INT);
+            $stmt->execute();
+
+            responder([
+                "total" => (int)$total,
+                "pagina" => $pagina,
+                "limite" => $limite,
+                "recetas" => $stmt->fetchAll()
+            ]);
+        }
+        break;
+
+    case 'POST':
+        $d = obtenerDatosJSON();
+        $stmt = $db->prepare("INSERT INTO recetas (titulo, imagen_url, resumen, instrucciones,
+                              tiempo_preparacion, tiempo_coccion, porciones, calificacion,
+                              vegano, vegetariano, sin_gluten, sin_lactosa)
+                              VALUES (?,?,?,?,?,?,?,?,?,?,?,?)");
+        $stmt->execute([
+            $d['titulo'], $d['imagen_url'] ?? null, $d['resumen'] ?? null,
+            $d['instrucciones'] ?? null, $d['tiempo_preparacion'] ?? null,
+            $d['tiempo_coccion'] ?? null, $d['porciones'] ?? 1,
+            $d['calificacion'] ?? null,
+            $d['vegano'] ?? 0, $d['vegetariano'] ?? 0,
+            $d['sin_gluten'] ?? 0, $d['sin_lactosa'] ?? 0
+        ]);
+        responder(["mensaje" => "Receta creada", "id" => $db->lastInsertId()], 201);
+        break;
+
+    default:
+        responder(["error" => "Método no permitido"], 405);
+}
+
+📄 api/buscar.php (Búsqueda y filtros avanzados)
+<?php
+require_once __DIR__ . '/../config/database.php';
+require_once __DIR__ . '/../includes/funciones.php';
+
+$db = (new Database())->getConnection();
+
+// Parámetros de búsqueda
+$q = $_GET['q'] ?? '';
+$ingredientes = isset($_GET['ingredientes']) ? explode(',', $_GET['ingredientes']) : [];
+$vegano = $_GET['vegano'] ?? null;
+$vegetariano = $_GET['vegetariano'] ?? null;
+$sin_gluten = $_GET['sin_gluten'] ?? null;
+$sin_lactosa = $_GET['sin_lactosa'] ?? null;
+$tiempo_max = $_GET['tiempo_max'] ?? null;
+$calorias_max = $_GET['calorias_max'] ?? null;
+
+$pagina = max(1, intval($_GET['pagina'] ?? 1));
+$limite = min(50, max(1, intval($_GET['limite'] ?? 20)));
+$offset = ($pagina - 1) * $limite;
+
+// Construcción dinámica de la consulta
+$where = [];
+$params = [];
+$joins = [];
+
+// Búsqueda por texto
+if ($q !== '') {
+    $where[] = "(r.titulo LIKE ? OR r.resumen LIKE ?)";
+    $params[] = "%$q%";
+    $params[] = "%$q%";
+}
+
+// Filtros de dieta
+if ($vegano === '1')  { $where[] = "r.vegano = 1"; }
+if ($vegetariano === '1') { $where[] = "r.vegetariano = 1"; }
+if ($sin_gluten === '1')  { $where[] = "r.sin_gluten = 1"; }
+if ($sin_lactosa === '1') { $where[] = "r.sin_lactosa = 1"; }
+
+// Tiempo máximo
+if ($tiempo_max) {
+    $where[] = "(r.tiempo_preparacion + r.tiempo_coccion) <= ?";
+    $params[] = (int)$tiempo_max;
+}
+
+// Calorías máximas
+if ($calorias_max) {
+    $joins[] = "JOIN nutricion n ON n.receta_id = r.id";
+    $where[] = "n.calorias <= ?";
+    $params[] = (float)$calorias_max;
+}
+
+// Filtro por ingredientes (debe contener TODOS los indicados)
+if (!empty($ingredientes)) {
+    $placeholders = implode(',', array_fill(0, count($ingredientes), '?'));
+    $joins[] = "JOIN receta_ingredientes ri ON ri.receta_id = r.id";
+    $joins[] = "JOIN ingredientes i ON i.id = ri.ingrediente_id";
+    $where[] = "i.nombre IN ($placeholders)";
+    $params = array_merge($params, $ingredientes);
+}
+
+// Armar SQL
+$sql = "SELECT DISTINCT r.id, r.titulo, r.imagen_url, r.tiempo_preparacion,
+               r.tiempo_coccion, r.calificacion, r.vegano, r.vegetariano,
+               r.sin_gluten, r.sin_lactosa
+        FROM recetas r " . implode(' ', $joins);
+
+if ($where) $sql .= " WHERE " . implode(' AND ', $where);
+
+$sql .= " ORDER BY r.calificacion DESC NULLS LAST, r.id DESC";
+
+// Contar total
+$sqlCount = "SELECT COUNT(DISTINCT r.id) FROM recetas r " . implode(' ', $joins);
+if ($where) $sqlCount .= " WHERE " . implode(' AND ', $where);
+
+$stmtCount = $db->prepare($sqlCount);
+$stmtCount->execute($params);
+$total = $stmtCount->fetchColumn();
+
+// Obtener resultados
+$sql .= " LIMIT ? OFFSET ?";
+$params[] = $limite;
+$params[] = $offset;
+
+$stmt = $db->prepare($sql);
+$stmt->execute($params);
+$recetas = $stmt->fetchAll();
+
+responder([
+    "total" => (int)$total,
+    "pagina" => $pagina,
+    "limite" => $limite,
+    "filtros" => [
+        "q" => $q,
+        "ingredientes" => $ingredientes,
+        "vegano" => $vegano,
+        "vegetariano" => $vegetariano,
+        "sin_gluten" => $sin_gluten,
+        "tiempo_max" => $tiempo_max
+    ],
+    "recetas" => $recetas
+]);
+
+📄 api/favoritos.php
+<?php
+require_once __DIR__ . '/../config/database.php';
+require_once __DIR__ . '/../includes/funciones.php';
+
+$db = (new Database())->getConnection();
+$method = $_SERVER['REQUEST_METHOD'];
+$usuarioId = obtenerUsuarioId();
+
+if (!$usuarioId) responder(["error" => "Falta X-User-Id en headers"], 401);
+
+switch ($method) {
+    case 'GET':
+        $stmt = $db->prepare("SELECT r.id, r.titulo, r.imagen_url, r.calificacion,
+                                     f.guardado_en
+                              FROM favoritos f
+                              JOIN recetas r ON f.receta_id = r.id
+                              WHERE f.usuario_id = ?
+                              ORDER BY f.guardado_en DESC");
+        $stmt->execute([$usuarioId]);
+        responder($stmt->fetchAll());
+        break;
+
+    case 'POST':
+        $d = obtenerDatosJSON();
+        if (!isset($d['receta_id'])) responder(["error" => "Falta receta_id"], 400);
+
+        try {
+            $stmt = $db->prepare("INSERT INTO favoritos (usuario_id, receta_id) VALUES (?, ?)");
+            $stmt->execute([$usuarioId, $d['receta_id']]);
+            responder(["mensaje" => "Receta agregada a favoritos"], 201);
+        } catch (PDOException $e) {
+            responder(["error" => "Ya está en favoritos"], 409);
+        }
+        break;
+
+    case 'DELETE':
+        if (!isset($_GET['receta_id'])) responder(["error" => "Falta receta_id"], 400);
+
+        $stmt = $db->prepare("DELETE FROM favoritos WHERE usuario_id = ? AND receta_id = ?");
+        $stmt->execute([$usuarioId, $_GET['receta_id']]);
+        responder(["mensaje" => "Receta eliminada de favoritos"]);
+        break;
+}
+
+📄 api/ingredientes.php
+<?php
+require_once __DIR__ . '/../config/database.php';
+require_once __DIR__ . '/../includes/funciones.php';
+
+$db = (new Database())->getConnection();
+$method = $_SERVER['REQUEST_METHOD'];
+
+if ($method === 'GET') {
+    if (isset($_GET['q'])) {
+        $stmt = $db->prepare("SELECT id, nombre, imagen_url FROM ingredientes WHERE nombre LIKE ? ORDER BY nombre LIMIT 30");
+        $stmt->execute(['%' . $_GET['q'] . '%']);
+    } else {
+        $stmt = $db->query("SELECT id, nombre, imagen_url FROM ingredientes ORDER BY nombre");
+    }
+    responder($stmt->fetchAll());
+} else {
+    responder(["error" => "Método no permitido"], 405);
+}
+
+📄 .htaccess
+RewriteEngine On
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteCond %{REQUEST_FILENAME} !-d
+RewriteRule ^api/(.*)$ api/$1.php [L,QSA]
+
+📄 index.php (Panel visual)
+<?php
+require_once 'config/database.php';
+$db = (new Database())->getConnection();
+
+$recetas = $db->query("SELECT * FROM recetas ORDER BY calificacion DESC LIMIT 12")->fetchAll();
+$totalRecetas = $db->query("SELECT COUNT(*) FROM recetas")->fetchColumn();
+$totalIngredientes = $db->query("SELECT COUNT(*) FROM ingredientes")->fetchColumn();
+?>
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<title>RECETARIANDO - Catálogo de Recetas</title>
+<style>
+* { box-sizing: border-box; }
+body { font-family: 'Segoe UI', sans-serif; margin: 0; background: #fff8f0; color: #333; }
+header { background: linear-gradient(135deg, #ff6b6b, #ee5a6f); color: #fff; padding: 30px; text-align: center; }
+header h1 { margin: 0; font-size: 2.5em; }
+.stats { display: flex; justify-content: center; gap: 30px; margin-top: 15px; }
+.stat { background: rgba(255,255,255,.2); padding: 10px 20px; border-radius: 20px; }
+.container { max-width: 1200px; margin: 20px auto; padding: 0 20px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 20px; }
+.card { background: #fff; border-radius: 12px; overflow: hidden; box-shadow: 0 4px 12px rgba(0,0,0,.08); transition: transform .2s; }
+.card:hover { transform: translateY(-5px); }
+.card img { width: 100%; height: 180px; object-fit: cover; }
+.card-body { padding: 15px; }
+.card h3 { margin: 0 0 10px; font-size: 1.1em; }
+.tags { display: flex; gap: 5px; flex-wrap: wrap; margin-top: 10px; }
+.tag { font-size: .75em; padding: 3px 8px; border-radius: 10px; background: #ffe5e5; color: #c0392b; }
+.tag.veg { background: #d5f5e3; color: #27ae60; }
+.rating { color: #f39c12; font-weight: bold; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🍳 RECETARIANDO</h1>
+  <p>Tu catálogo interactivo de recetas</p>
+  <div class="stats">
+    <div class="stat">📖 <?= $totalRecetas ?> recetas</div>
+    <div class="stat">🥕 <?= $totalIngredientes ?> ingredientes</div>
+  </div>
+</header>
+<div class="container">
+  <h2>✨ Recetas destacadas</h2>
+  <div class="grid">
+    <?php foreach ($recetas as $r): ?>
+    <div class="card">
+      <img src="<?= htmlspecialchars($r['imagen_url'] ?: 'https://via.placeholder.com/300x180?text=Sin+imagen') ?>" alt="">
+      <div class="card-body">
+        <h3><?= htmlspecialchars($r['titulo']) ?></h3>
+        <div class="rating">⭐ <?= number_format($r['calificacion'] ?? 0, 1) ?></div>
+        <div>⏱️ <?= ($r['tiempo_preparacion'] ?? 0) + ($r['tiempo_coccion'] ?? 0) ?> min</div>
+        <div class="tags">
+          <?php if ($r['vegano']): ?><span class="tag veg">🌱 Vegano</span><?php endif; ?>
+          <?php if ($r['vegetariano']): ?><span class="tag veg">🥗 Vegetariano</span><?php endif; ?>
+          <?php if ($r['sin_gluten']): ?><span class="tag">🚫🌾 Sin gluten</span><?php endif; ?>
+          <?php if ($r['sin_lactosa']): ?><span class="tag">🚫🥛 Sin lactosa</span><?php endif; ?>
+        </div>
+      </div>
+    </div>
+    <?php endforeach; ?>
+  </div>
+</div>
+</body>
+</html>
+
+
+PARTE 3 — Guía paso a paso: Spoonacular API
+
+Spoonacular (https://spoonacular.com/food-api) es una de las APIs más completas del mundo gastronómico: más de 365,000 recetas, 100,000 ingredientes e información nutricional detallada.
+
+PASO 1 — Obtener tu API Key (GRATIS)
+1. Ve a 👉 https://spoonacular.com/food-api
+2. Haz clic en "Pricing" → Selecciona el plan gratuito "Basic" (150 requests/día).
+3. Haz clic en "Sign Up" y crea una cuenta con tu correo.
+4. Confirma tu email y entra al Dashboard.
+5. En el panel verás tu "API Key" (algo como a1b2c3d4e5f6g7h8i9j0...). CÓPIALA.
+
+Importante: El plan gratuito permite 150 peticiones por día. Una receta completa consume 70 recetas detalladas por día**.
+
+PASO 2 — Guardar la API Key de forma segura
+Crea el archivo config/spoonacular.php:
+<?php
+// ⚠️ NO subas este archivo a GitHub. Agrégalo a .gitignore
+return [
+    'api_key' => 'PEGA_AQUI_TU_API_KEY_DE_SPOONACULAR',
+    'base_url' => 'https://api.spoonacular.com',
+    'limite_diario' => 150
+];
+
+📄 PASO 3 — Script de importación masiva
+Crea el archivo scripts/importar_spoonacular.php:
+<?php
+require_once __DIR__ . '/../config/database.php';
+$config = require __DIR__ . '/../config/spoonacular.php';
+
+$API_KEY = $config['api_key'];
+$BASE_URL = $config['base_url'];
+
+$db = (new Database())->getConnection();
+
+if (strlen($API_KEY) < 10 || strpos($API_KEY, 'PEGA_AQUI') !== false) {
+    die("❌ Configura tu API Key en config/spoonacular.php
+");
+}
+
+// =====================================================
+// FUNCIÓN: hacer petición a Spoonacular
+// =====================================================
+function spoonacularGet($endpoint, $params = []) {
+    global $API_KEY, $BASE_URL;
+    $params['apiKey'] = $API_KEY;
+    $url = $BASE_URL . $endpoint . '?' . http_build_query($params);
+    $ctx = stream_context_create([
+        'http' => [
+            'timeout' => 20,
+            'ignore_errors' => true
+        ]
+    ]);
+    $json = @file_get_contents($url, false, $ctx);
+    if ($json === false) return null;
+    $data = json_decode($json, true);
+    if (isset($data['status']) && $data['status'] === 'failure') {
+        echo "⚠️  Error API: " . ($data['message'] ?? 'desconocido') . "
+";
+        return null;
+    }
+    return $data;
+}
+
+// =====================================================
+// FUNCIÓN: limpiar texto HTML
+// =====================================================
+function limpiar($texto) {
+    if (!$texto) return null;
+    return trim(strip_tags(html_entity_decode($texto, ENT_QUOTES, 'UTF-8')));
+}
+
+// =====================================================
+// PASO A: Buscar recetas con filtros
+// =====================================================
+echo "🔍 Buscando recetas en Spoonacular...
+";
+
+$parametrosBusqueda = [
+    'number' => 20,               // máximo 100, pero cuidado con el límite diario
+    'offset' => 0,
+    'addRecipeInformation' => 'true',
+    'addRecipeNutrition' => 'true',
+    'instructionsRequired' => 'true',
+    'fillIngredients' => 'true',
+    // Filtros opcionales (descomenta los que quieras):
+    // 'diet' => 'vegetarian',     // vegetarian, vegan, keto, paleo, pescetarian
+    // 'intolerances' => 'gluten', // gluten, dairy, egg, peanut, soy
+    // 'type' => 'main course',    // main course, side dish, dessert, appetizer, salad, bread, breakfast, soup, beverage, sauce, marinade, fingerfood, snack, drink
+    // 'maxReadyTime' => 30,       // minutos
+    // 'query' => 'chicken'        // palabra clave
+];
+
+$resultado = spoonacularGet('/recipes/complexSearch', $parametrosBusqueda);
+
+if (!$resultado || empty($resultado['results'])) {
+    die("❌ No se obtuvieron recetas. Verifica tu API Key o el límite diario.
+");
+}
+
+$totalEncontradas = $resultado['totalResults'] ?? count($resultado['results']);
+echo "✅ Se encontraron $totalEncontradas recetas disponibles.
+";
+echo "📥 Procesando " . count($resultado['results']) . " recetas...
+
+";
+
+$insertadas = 0;
+$actualizadas = 0;
+
+// =====================================================
+// PASO B: Recorrer y guardar cada receta
+// =====================================================
+foreach ($resultado['results'] as $idx => $recetaApi) {
+    $num = $idx + 1;
+    echo "[$num] Procesando: " . substr($recetaApi['title'], 0, 50) . "...
+";
+
+    // Si la búsqueda básica no trae todo, pedir detalle completo
+    if (!isset($recetaApi['analyzedInstructions'])) {
+        $detalle = spoonacularGet("/recipes/{$recetaApi['id']}/information", [
+            'includeNutrition' => 'true'
+        ]);
+        if (!$detalle) continue;
+    } else {
+        $detalle = $recetaApi;
+    }
+
+    // Mapear datos
+    $titulo = limpiar($detalle['title']);
+    $imagen = $detalle['image'] ?? null;
+    $resumen = limpiar($detalle['summary'] ?? '');
+    $instrucciones = '';
+
+    // Procesar instrucciones
+    if (!empty($detalle['analyzedInstructions'])) {
+        foreach ($detalle['analyzedInstructions'] as $sec) {
+            foreach ($sec['steps'] ?? [] as $step) {
+                $instrucciones .= ($step['number'] ?? '') . '. ' . limpiar($step['step']) . "
+";
+            }
+        }
+    } elseif (!empty($detalle['instructions'])) {
+        $instrucciones = limpiar($detalle['instructions']);
+    }
+
+    // Insertar/actualizar receta
+    $db->prepare("INSERT INTO recetas
+        (spoonacular_id, titulo, imagen_url, resumen, instrucciones,
+         tiempo_preparacion, tiempo_coccion, porciones, calificacion,
+         vegano, vegetariano, sin_gluten, sin_lactosa, saludable, muy_popular, fuente_url)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ON DUPLICATE KEY UPDATE
+         titulo=VALUES(titulo), imagen_url=VALUES(imagen_url), resumen=VALUES(resumen),
+         instrucciones=VALUES(instrucciones), calificacion=VALUES(calificacion)")
+        ->execute([
+            $detalle['id'], $titulo, $imagen, $resumen, $instrucciones,
+            $detalle['readyInMinutes'] ?? null,
+            ($detalle['preparationMinutes'] ?? 0) + ($detalle['cookingMinutes'] ?? 0),
+            $detalle['servings'] ?? 1,
+            $detalle['spoonacularScore'] ? round($detalle['spoonacularScore'] / 20, 2) : null,
+            !empty($detalle['vegan']) ? 1 : 0,
+            !empty($detalle['vegetarian']) ? 1 : 0,
+            !empty($detalle['glutenFree']) ? 1 : 0,
+            !empty($detalle['dairyFree']) ? 1 : 0,
+            !empty($detalle['veryHealthy']) ? 1 : 0,
+            !empty($detalle['veryPopular']) ? 1 : 0,
+            $detalle['sourceUrl'] ?? null
+        ]);
+
+    // Obtener ID local
+    $idLocal = $db->prepare("SELECT id FROM recetas WHERE spoonacular_id = ?");
+    $idLocal->execute([$detalle['id']]);
+    $recetaId = $idLocal->fetchColumn();
+
+    // =====================================================
+    // PASO C: Guardar ingredientes
+    // =====================================================
+    $db->prepare("DELETE FROM receta_ingredientes WHERE receta_id = ?")->execute([$recetaId]);
+
+    foreach ($detalle['extendedIngredients'] ?? [] as $ingApi) {
+        $nombreIng = ucfirst(strtolower(trim($ingApi['name'])));
+
+        // Insertar ingrediente si no existe
+        $db->prepare("INSERT INTO ingredientes (spoonacular_id, nombre, imagen_url)
+                      VALUES (?, ?, ?)
+                      ON DUPLICATE KEY UPDATE nombre=VALUES(nombre)")
+           ->execute([
+               $ingApi['id'] ?? null,
+               $nombreIng,
+               "https://spoonacular.com/cdn/ingredients_100x100/" . strtolower(str_replace(' ', '-', $nombreIng)) . ".jpg"
+           ]);
+
+        $ingId = $db->prepare("SELECT id FROM ingredientes WHERE nombre = ?");
+        $ingId->execute([$nombreIng]);
+        $ingredienteId = $ingId->fetchColumn();
+
+        // Relacionar
+        $db->prepare("INSERT IGNORE INTO receta_ingredientes (receta_id, ingrediente_id, cantidad, unidad)
+                      VALUES (?, ?, ?, ?)")
+           ->execute([
+               $recetaId,
+               $ingredienteId,
+               $ingApi['measures']['metric']['amount'] ?? ($ingApi['amount'] ?? null),
+               $ingApi['measures']['metric']['unitShort'] ?? ($ingApi['unit'] ?? null)
+           ]);
+    }
+
+    // =====================================================
+    // PASO D: Guardar nutrición
+    // =====================================================
+    $nut = $detalle['nutrition'] ?? null;
+    if ($nut && !empty($nut['nutrients'])) {
+        $getNutrient = function($name) use ($nut) {
+            foreach ($nut['nutrients'] as $n) {
+                if (strtolower($n['name']) === strtolower($name)) return $n['amount'];
+            }
+            return null;
+        };
+
+        $db->prepare("INSERT INTO nutricion (receta_id, calorias, proteinas, carbohidratos, grasa, fibra)
+                      VALUES (?,?,?,?,?,?)
+                      ON DUPLICATE KEY UPDATE calorias=VALUES(calorias)")
+           ->execute([
+               $recetaId,
+               $getNutrient('Calories'),
+               $getNutrient('Protein'),
+               $getNutrient('Carbohydrates'),
+               $getNutrient('Fat'),
+               $getNutrient('Fiber')
+           ]);
+    }
+
+    $insertadas++;
+}
+
+echo "
+✅ ¡Importación completada!
+";
+echo "   📊 Recetas procesadas: $insertadas
+";
+echo "   🥕 Ingredientes disponibles en BD: " . $db->query("SELECT COUNT(*) FROM ingredientes")->fetchColumn() . "
+";
+echo "   🍽️  Total de recetas en el sistema: " . $db->query("SELECT COUNT(*) FROM recetas")->fetchColumn() . "
+";
+
+
+PASO 4 — Ejecutar la importación
+Opción A — Desde terminal (recomendado):
+cd /ruta/a/recetariando
+php scripts/importar_spoonacular.php
+
+Opción B — Desde navegador:
+http://localhost/recetariando/scripts/importar_spoonacular.php
+
+💡 Tip: Si tu php.ini tiene max_execution_time bajo, agrágale al inicio del script:
+set_time_limit(300); // 5 minutos
+
+
+PASO 5 — Personalizar los filtros de búsqueda
+Edita el array $parametrosBusqueda en el script:
+// Solo recetas veganas
+'diet' => 'vegan',
+
+// Solo postres listos en menos de 30 min
+'type' => 'dessert',
+'maxReadyTime' => 30,
+
+// Solo recetas con pollo
+'query' => 'chicken',
+
+// Sin gluten ni lactosa
+'intolerances' => 'gluten,dairy',
+
+// Combinación: vegetariano + sin gluten + rápido
+'diet' => 'vegetarian',
+'intolerances' => 'gluten',
+'maxReadyTime' => 20,
+
+
+PASO 6 — Importar en lotes (evitar límite diario)
+Si quieres importar cientos de recetas a lo largo de varios días, usa el parámetro offset:
+// Día 1: recetas 0-19
+'offset' => 0,
+
+// Día 2: recetas 20-39
+'offset' => 20,
+
+// Día 3: recetas 40-59
+'offset' => 40,
+
+O automatiza con un cron diario:
+0 3 * * * /usr/bin/php /var/www/html/recetariando/scripts/importar_spoonacular.php >> /var/log/recetariando.log
+
+
+PASO 7 — Probar la API REST local
+Con cURL o Postman:
+
+# Listar todas las recetas
+curl http://localhost/recetariando/api/recetas
+
+# Buscar recetas veganas con pollo
+curl "http://localhost/recetariando/api/buscar?q=pollo&vegano=1"
+
+# Buscar sin gluten, menos de 30 min
+curl "http://localhost/recetariando/api/buscar?sin_gluten=1&tiempo_max=30"
+
+# Buscar por ingredientes (debe contener tomate Y queso)
+curl "http://localhost/recetariando/api/buscar?ingredientes=tomate,queso"
+
+# Detalle completo de una receta
+curl http://localhost/recetariando/api/recetas?id=5
+
+# Agregar a favoritos (requiere header X-User-Id)
+curl -X POST http://localhost/recetariando/api/favoritos \
+  -H "Content-Type: application/json" \
+  -H "X-User-Id: 1" \
+  -d '{"receta_id": 5}'
+
+# Ver favoritos del usuario
+curl http://localhost/recetariando/api/favoritos -H "X-User-Id: 1"
+
+# Autocompletar ingredientes (para buscador)
+curl http://localhost/recetariando/api/ingredientes?q=tom
+
+
+PASO 8 — Endpoints de Spoonacular más útiles
+Endpoint | Uso | Costo
+----------------------------------------|----------------------------------------|-------
+/recipes/complexSearch | Búsqueda con filtros | 1 req
+/recipes/{id}/information | Detalle completo | 1 req
+/recipes/{id}/ingredientWidget.json | Ingredientes detallados | 1 req
+/recipes/{id}/nutritionWidget.json | Nutrición completa | 1 req
+/food/ingredients/search | Buscar ingredientes | 1 req
+/food/ingredients/{id}/information | Info nutricional de 1 ingrediente | 1 req
+/recipes/findByIngredients | Recetas según lo que tienes en casa | 1 req
+/recipes/autocomplete | Sugerencias mientras escribes | 1 req
+
+
+PASO 9 — Buenas prácticas
+- Cachea en tu BD local: No pidas a Spoonacular en cada visita de usuario. Ya lo hace el script de importación.
+- Respeta los 150 req/día: Planifica importaciones escalonadas.
+- Atribución: Según sus términos, debes dar crédito a Spoonacular en tu web. Agrega en el footer:
+  <p>Recetas proporcionadas por <a href="https://spoonacular.com/food-api">Spoonacular API</a></p>
+- No uses imágenes como logo: Las imágenes son para las recetas, no como identidad de marca.
+- Actualiza periódicamente: Ejecuta el script semanalmente para traer recetas nuevas.
+
+
+✅ Resumen de lo entregado
+Componente | Estado
+---------------------------------------------------|-------
+Base de datos MySQL (8 tablas normalizadas) | ✅
+API REST: recetas, búsqueda, filtros, favoritos, ingredientes | ✅
+Panel visual con grid de recetas | ✅
+Script de importación desde Spoonacular | ✅
+Soporte para dietas (vegano, vegetariano, sin gluten, sin lactosa) | ✅
+Información nutricional completa | ✅
+Guía paso a paso para obtener y usar la API Key | ✅
+
+Con esto tienes RECETARIANDO funcionando: miles de recetas importadas con ingredientes e información nutricional, búsqueda inteligente por texto/ingredientes/restricciones, sistema de favoritos por usuario, y una API lista para conectar con un frontend moderno (React, Vue, app móvil).

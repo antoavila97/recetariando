@@ -1,0 +1,22 @@
+# dependencias
+node_modules/
+
+# build
+dist/
+dist-ssr/
+
+# variables de entorno (NUNCA subir a git)
+.env
+.env.local
+.env.*.local
+
+# logs
+*.log
+npm-debug.log*
+
+# editor
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
