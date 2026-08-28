@@ -1,13 +1,21 @@
+import { useState } from 'react'
 import { Link } from 'react-router-dom'
 import type { RecetaResumen } from '../lib/tipos'
 import { tiempoTotal } from '../lib/api'
 
 export default function TarjetaReceta({ receta }: { receta: RecetaResumen }) {
+  const [imagenOk, setImagenOk] = useState(true)
+
   return (
     <Link to={`/receta/${receta.id}`} className="card">
       <div className="card-imagen">
-        {receta.imagen_url ? (
-          <img src={receta.imagen_url} alt={receta.titulo} loading="lazy" />
+        {receta.imagen_url && imagenOk ? (
+          <img
+            src={receta.imagen_url}
+            alt={receta.titulo}
+            loading="lazy"
+            onError={() => setImagenOk(false)}
+          />
         ) : (
           <div className="card-imagen-fallback">🍽️</div>
         )}

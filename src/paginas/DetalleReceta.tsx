@@ -25,6 +25,7 @@ export default function DetalleReceta() {
   const [error, setError] = useState<string | null>(null)
   const [fav, setFav] = useState(false)
   const [favCargando, setFavCargando] = useState(false)
+  const [imagenOk, setImagenOk] = useState(true)
 
   useEffect(() => {
     let activo = true
@@ -120,8 +121,12 @@ export default function DetalleReceta() {
 
       <article className="detalle-hero">
         <div className="detalle-imagen">
-          {receta.imagen_url ? (
-            <img src={receta.imagen_url} alt={receta.titulo} />
+          {receta.imagen_url && imagenOk ? (
+            <img
+              src={receta.imagen_url}
+              alt={receta.titulo}
+              onError={() => setImagenOk(false)}
+            />
           ) : (
             <div className="card-imagen-fallback detalle-imagen-fallback">🍽️</div>
           )}
